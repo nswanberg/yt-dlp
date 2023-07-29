@@ -286,3 +286,8 @@ def get_all_subs_by_channel_id_ss(channel_id):
         if len(sub[3].strip()) > 0:
             parsed_subs.append(sub)
     return parsed_subs
+
+def get_downloaded_files():
+    db = Database(get_db_path())
+    result = db.execute("SELECT video_id FROM Videos").fetchall()
+    return list(set(x[0] for x in result))

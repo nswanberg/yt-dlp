@@ -5,9 +5,15 @@ from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
 from .config import get_db_path
-from .db_utils import add_video
+from .db_utils import add_video, get_downloaded_files
 from .utils import parse_vtt
 
+from functools import lru_cache
+from time import sleep
+from retrying import retry
+from ratelimiter import RateLimiter
+
+DOWNLOAD_DIRERCTORY = "downloads"
 
 def handle_reject_consent_cookie(channel_url, s):
     """
@@ -69,7 +75,7 @@ def get_channel_name(channel_id, s):
     else:
         return None
 
-
+@lru_cache(maxsize=None)
 def get_videos_list(channel_url):
     """
     Scrapes list of all video urls from the channel
@@ -85,20 +91,40 @@ def get_videos_list(channel_url):
     list_of_videos_urls = res.stdout.decode().splitlines()
     return list_of_videos_urls 
 
+def get_downloaded_video_id_from_dir(download_dir):
+    """Retrieves all video_ids from the download directory, in the
+    format <video_id>.<lang>.vtt"""
+    files = os.listdir(download_dir)
+    video_ids = []
+    for file in files:
+        video_id = re.match(r'^([^.]*)', file).group(1)
+        video_ids.append(video_id)
+    return video_ids
+
 
 def download_vtts(number_of_jobs, list_of_videos_urls, language ,tmp_dir):
-    """
-    Multi-threaded download of vtt files
-    """
+    downloaded_files = get_downloaded_files()
+    downloaded_files.extend(get_downloaded_video_id_from_dir(tmp_dir))
     executor = ThreadPoolExecutor(number_of_jobs)
     futures = []
+    rate_limiter = RateLimiter(max_calls=10, period=1) # Adjust as needed
+
     for video_id in list_of_videos_urls:
+        if video_id in downloaded_files:
+            continue
         video_url = f'https://www.youtube.com/watch?v={video_id}'
-        future = executor.submit(get_vtt, tmp_dir, video_url, language)
-        futures.append(future)
+        with rate_limiter:
+            future = executor.submit(retry_get_vtt, tmp_dir, video_url, language)
+            futures.append(future)
     
     for i in range(len(list_of_videos_urls)):
-        futures[i].result()
+        if list_of_videos_urls[i] not in downloaded_files:
+            futures[i].result()
+
+
+@retry(stop_max_attempt_number=3, wait_fixed=2000)
+def retry_get_vtt(tmp_dir, video_url, language):
+    get_vtt(tmp_dir, video_url, language)
 
 
 def get_vtt(tmp_dir, video_url, language):
@@ -113,13 +139,14 @@ def get_vtt(tmp_dir, video_url, language):
     ])
 
 
-def vtt_to_db(channel_id, dir_path, s):
+def vtt_to_db(channel_id, dir_path, s, local_video_ids=None):
     """
     Iterates through all vtt files in the temp_dir, passes them to 
     the vtt parsing function, then inserts the data into the database.
     """
     items = os.listdir(dir_path)
     file_paths = []
+    parsed_count = 0
 
     for item in items:
         item_path = os.path.join(dir_path, item)
@@ -134,6 +161,8 @@ def vtt_to_db(channel_id, dir_path, s):
     for vtt in file_paths:
         base_name = os.path.basename(vtt)
         vid_id = re.match(r'^([^.]*)', base_name).group(1)
+        if vid_id in local_video_ids:
+            continue
         vid_url = f"https://youtu.be/{vid_id}"
         vid_title = get_vid_title(vid_url, s)
         add_video(channel_id, vid_id, vid_title, vid_url)
@@ -144,12 +173,14 @@ def vtt_to_db(channel_id, dir_path, s):
             start_time = sub['start_time']
             text = sub['text']
             cur.execute(f"INSERT INTO Subtitles (video_id, timestamp, text) VALUES (?, ?, ?)", (vid_id, start_time, text))
+            parsed_count += 1
 
         con.commit()
         bar.next()
 
     bar.finish() 
     con.close()
+    return parsed_count
 
 
 def get_vid_title(vid_url, s):
@@ -173,7 +204,8 @@ def check_channel_url_pattern(channel_url):
 
     from yt_fts.utils import show_message
 
-    expected_url_format = "https:\/\/www.youtube.com\/@(.*)\/videos"
+    # expect a url for either videos or streams using (videos|streams)
+    expected_url_format = "https:\/\/www.youtube.com\/@(.*)\/(videos|streams)"
     if not re.match(expected_url_format, channel_url):
         show_message("channel_url_not_correct")
         exit()
@@ -187,12 +219,20 @@ def download_channel(channel_id, channel_name, language, number_of_jobs, s):
     import tempfile
     from yt_fts.db_utils import add_channel_info
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
-        list_of_videos_urls = get_videos_list(channel_url)
-        download_vtts(number_of_jobs, list_of_videos_urls, language, tmp_dir)
-        add_channel_info(channel_id, channel_name, channel_url)
-        vtt_to_db(channel_id, tmp_dir, s)
+    #with tempfile.TemporaryDirectory() as tmp_dir:
+
+    channel_url = f"https://www.youtube.com/channel/{channel_id}"
+    video_url = f"{channel_url}/videos"
+    stream_url = f"{channel_url}/streams"
+    list_of_videos_urls = get_videos_list(video_url)
+    print(f"Found {len(list_of_videos_urls)} videos")
+    list_of_streams_urls = get_videos_list(stream_url)
+    print(f"Found {len(list_of_streams_urls)} streams")
+    list_of_videos_urls.extend(list_of_streams_urls)
+    print(f"Found {len(list_of_videos_urls)} videos and streams")
+    download_vtts(number_of_jobs, list_of_videos_urls, language, DOWNLOAD_DIRERCTORY)
+    add_channel_info(channel_id, channel_name, channel_url)
+    vtt_to_db(channel_id, DOWNLOAD_DIRERCTORY, s)
 
 
 def get_channel_id_from_input(channel_input):

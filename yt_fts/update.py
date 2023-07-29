@@ -1,41 +1,51 @@
 import tempfile, os
 
-from .download import get_videos_list, download_vtts, vtt_to_db
+from .download import (
+    get_videos_list,
+    download_vtts,
+    vtt_to_db,
+    get_downloaded_video_id_from_dir,
+    DOWNLOAD_DIRERCTORY,
+)
 from .db_utils import add_channel_info, get_num_vids, get_vid_ids_by_channel_id
+
 
 def update_channel(channel_id, channel_name, language, number_of_jobs, s):
     """
     Downloads all the videos from a channel to a tmp directory
     """
-    with tempfile.TemporaryDirectory() as tmp_dir:
+    # with tempfile.TemporaryDirectory() as tmp_dir:
 
-        channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    channel_url = f"https://www.youtube.com/channel/{channel_id}"
+    video_url = f"{channel_url}/videos"
+    stream_url = f"{channel_url}/streams"
 
-        public_video_ids = get_videos_list(channel_url)
-        num_public_vids = len(public_video_ids)
-        num_local_vids = get_num_vids(channel_id)
+    public_video_ids = get_videos_list(channel_url)
+    list_of_videos_urls = get_videos_list(video_url)
+    print(f"Found {len(list_of_videos_urls)} videos")
+    list_of_streams_urls = get_videos_list(stream_url)
+    print(f"Found {len(list_of_streams_urls)} streams")
 
-        if num_public_vids == num_local_vids:
-            print("No new videos to download")
-            exit()
+    list_of_videos_urls.extend(list_of_streams_urls)
+    print(f"Found {len(list_of_videos_urls)} videos and streams")
 
-        local_vid_ids = get_vid_ids_by_channel_id(channel_id)
-        local_vid_ids = [i[0] for i in local_vid_ids]
+    num_public_vids = len(public_video_ids)
+    num_local_vids = get_num_vids(channel_id)
 
+    if num_public_vids == num_local_vids:
+        print("No new videos to download")
+        exit()
 
-        fresh_videos = [i for i in public_video_ids if i not in local_vid_ids]
+    local_vid_ids = get_vid_ids_by_channel_id(channel_id)
+    local_vid_ids = [i[0] for i in local_vid_ids]
 
-        print(f"Found {len(fresh_videos)} videos on \"{channel_name}\" not in the database")
-        print(f"Downloading {len(fresh_videos)} new videos from \"{channel_name}\"")
+    fresh_videos = [i for i in public_video_ids if i not in local_vid_ids]
 
-        download_vtts(number_of_jobs, fresh_videos, language, tmp_dir)
+    print(f'Found {len(fresh_videos)} videos on "{channel_name}" not in the database')
+    print(f'Downloading {len(fresh_videos)} new videos from "{channel_name}"')
 
-        vtt_to_parse = os.listdir(tmp_dir)
-        if len(vtt_to_parse) == 0:
-            print("No new videos saved")
-            print(f"{len(fresh_videos)} videos on \"{channel_name}\" do not have subtitles")
-            exit()
+    download_vtts(number_of_jobs, fresh_videos, language, DOWNLOAD_DIRERCTORY)
 
-        vtt_to_db(channel_id, tmp_dir, s)
+    new_video_count = vtt_to_db(channel_id, DOWNLOAD_DIRERCTORY, s, local_video_ids=local_vid_ids)
 
-        print(f"Added {len(vtt_to_parse)} new videos from \"{channel_name}\" to the database")
+    print(f'Added {new_video_count} new videos from "{channel_name}" to the database')
